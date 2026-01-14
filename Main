@@ -1,0 +1,650 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Liminal Stalker - Survival Horror</title>
+    <style>
+        body { margin: 0; overflow: hidden; background-color: #000; font-family: 'Courier New', Courier, monospace; }
+        #ui {
+            position: absolute;
+            top: 20px;
+            left: 20px;
+            color: #0f0;
+            text-shadow: 2px 2px #000;
+            pointer-events: none;
+            z-index: 10;
+        }
+        .bar-container {
+            width: 200px;
+            height: 10px;
+            border: 1px solid #0f0;
+            margin-top: 5px;
+            margin-bottom: 10px;
+            background: rgba(0, 50, 0, 0.3);
+        }
+        .bar-fill {
+            width: 100%;
+            height: 100%;
+            background-color: #0f0;
+            transition: width 0.3s;
+        }
+        #overload-fill { background-color: #0af; width: 0%; }
+        #minimap {
+            position: absolute;
+            top: 20px;
+            right: 20px;
+            width: 150px;
+            height: 150px;
+            background: rgba(0, 10, 0, 0.9);
+            border: 2px solid #0f0;
+            border-radius: 50%;
+            overflow: hidden;
+            z-index: 10;
+            box-shadow: 0 0 15px rgba(0, 255, 0, 0.2);
+        }
+        #minimap-canvas { width: 100%; height: 100%; }
+        
+        #signal-indicator {
+            position: absolute;
+            bottom: 15%;
+            left: 50%;
+            transform: translateX(-50%);
+            width: 200px;
+            height: 15px;
+            background: radial-gradient(circle, rgba(255, 255, 0, 1) 0%, transparent 80%);
+            filter: blur(10px);
+            opacity: 0;
+            z-index: 5;
+            pointer-events: none;
+        }
+
+        #overlay {
+            position: fixed;
+            top: 0; left: 0;
+            width: 100%; height: 100%;
+            display: flex;
+            flex-direction: column;
+            justify-content: center;
+            align-items: center;
+            background: rgba(0,0,0,0.95);
+            color: white;
+            z-index: 100;
+            cursor: pointer;
+            text-align: center;
+        }
+        #game-over, #win-screen { display: none; }
+        #win-screen { color: #0f0; }
+        #game-over { color: #f00; }
+        canvas { display: block; }
+        .hint { font-size: 0.8em; color: #888; }
+    </style>
+</head>
+<body>
+
+    <div id="ui">
+        <div id="status-text">SIGNAL: SEARCHING...</div>
+        <div>BATTERY: <span id="battery-text">100</span>%</div>
+        <div class="bar-container"><div id="battery-bar" class="bar-fill"></div></div>
+        <div>OVERLOAD: [SPACE]</div>
+        <div class="bar-container"><div id="overload-fill" class="bar-fill"></div></div>
+        <div class="hint">RADAR: RED=STALKER | YELLOW=SIGNAL</div>
+    </div>
+
+    <div id="signal-indicator"></div>
+
+    <div id="minimap">
+        <canvas id="minimap-canvas"></canvas>
+    </div>
+
+    <div id="overlay" onclick="window.startGame()">
+        <div id="intro-content">
+            <h1 id="title">LIMINAL STALKER</h1>
+            <p id="instructions">
+                Find the <b>Signal Booster</b> (Yellow) to escape.<br>
+                Avoid the entity that moves when unseen.<br><br>
+                WASD: Move | Mouse: Look | SPACE: Overload Lights
+            </p>
+        </div>
+        <div id="game-over">
+            <h1>CONNECTION LOST</h1>
+            <p>The subject was consumed by the void.</p>
+            <p>Click to try again.</p>
+        </div>
+        <div id="win-screen">
+            <h1>EXTRACTION COMPLETE</h1>
+            <p>Data successfully uploaded. Connection terminated.</p>
+            <p>Click to return to the void.</p>
+        </div>
+    </div>
+
+    <script type="importmap">
+        {
+            "imports": {
+                "three": "https://cdnjs.cloudflare.com/ajax/libs/three.js/0.160.0/three.module.min.js",
+                "three/addons/": "https://cdn.jsdelivr.net/npm/three@0.160.0/examples/jsm/"
+            }
+        }
+    </script>
+
+    <script type="module">
+        import * as THREE from 'three';
+        import { PointerLockControls } from 'three/addons/controls/PointerLockControls.js';
+        import { EffectComposer } from 'three/addons/postprocessing/EffectComposer.js';
+        import { RenderPass } from 'three/addons/postprocessing/RenderPass.js';
+        import { DotScreenPass } from 'three/addons/postprocessing/DotScreenPass.js';
+
+        const CONFIG = {
+            roomSize: 15,
+            mazeRadius: 5, 
+            batteryDepletionRate: 0.03,
+            stalkerBaseSpeed: 0.14, // Reduced from 0.26 (Significant slowdown)
+            stalkerAggroSpeed: 0.22, // Reduced from 0.39 (Slower proximity speed)
+            heartbeatMinFreq: 1.0,
+            heartbeatMaxFreq: 8.0,
+            baseLightIntensity: 1200,
+            overloadIntensity: 6.0, 
+            overloadDuration: 5000,
+            overloadCooldown: 15000,
+            fogDensity: 0.08,
+            playerRadius: 1.0, 
+            stalkerRadius: 0.4, 
+            winDistance: 130,
+            stalkerDespawnDist: 70, 
+            stalkerSpawnMinDist: 30, // Pushed min spawn further out
+            stalkerSpawnMaxDist: 40  // Pushed max spawn further out
+        };
+
+        let scene, camera, renderer, controls, composer;
+        let flashlight, flashlightTarget, clock, ambientLight;
+        let battery = 100, gameStarted = false, isGameOver = false, isJumpscaring = false, isWon = false;
+        
+        let minimapCanvas, minimapCtx;
+        let overloadActive = false, lastOverloadTime = -CONFIG.overloadCooldown;
+
+        const rooms = new Map();
+        let stalker, booster;
+        const walls = []; 
+        const wallData = []; 
+        const criticalPathKeys = new Set();
+
+        const velocity = new THREE.Vector3();
+        const direction = new THREE.Vector3();
+
+        let audioListener;
+        const moveKeys = { w: false, a: false, s: false, d: false };
+
+        function init() {
+            scene = new THREE.Scene();
+            scene.background = new THREE.Color(0x010101);
+            scene.fog = new THREE.FogExp2(0x010101, CONFIG.fogDensity);
+
+            camera = new THREE.PerspectiveCamera(75, window.innerWidth / window.innerHeight, 0.1, 1000);
+            camera.position.set(0, 1.7, 0);
+
+            renderer = new THREE.WebGLRenderer({ antialias: true });
+            renderer.setPixelRatio(window.devicePixelRatio);
+            renderer.setSize(window.innerWidth, window.innerHeight);
+            renderer.shadowMap.enabled = true;
+            document.body.appendChild(renderer.domElement);
+
+            controls = new PointerLockControls(camera, document.body);
+
+            composer = new EffectComposer(renderer);
+            composer.addPass(new RenderPass(scene, camera));
+            composer.addPass(new DotScreenPass(new THREE.Vector2(0,0), 0.5, 0.8));
+
+            flashlight = new THREE.SpotLight(0xffffff, CONFIG.baseLightIntensity, 40, Math.PI / 5, 0.4, 1);
+            flashlight.castShadow = true;
+            flashlight.shadow.mapSize.set(1024, 1024);
+            scene.add(flashlight);
+
+            flashlightTarget = new THREE.Object3D();
+            scene.add(flashlightTarget);
+            flashlight.target = flashlightTarget;
+
+            ambientLight = new THREE.AmbientLight(0xffffff, 0.1); 
+            scene.add(ambientLight);
+
+            audioListener = new THREE.AudioListener();
+            camera.add(audioListener);
+            setupAudio();
+            
+            createStalker();
+            createBooster();
+            precomputePath();
+            updateMaze(0, 0);
+
+            minimapCanvas = document.getElementById('minimap-canvas');
+            minimapCanvas.width = 300; 
+            minimapCanvas.height = 300;
+            minimapCtx = minimapCanvas.getContext('2d');
+
+            clock = new THREE.Clock();
+
+            window.addEventListener('resize', onWindowResize);
+            document.addEventListener('keydown', (e) => { 
+                if(moveKeys.hasOwnProperty(e.key.toLowerCase())) moveKeys[e.key.toLowerCase()] = true; 
+                if(e.code === 'Space') triggerOverload();
+            });
+            document.addEventListener('keyup', (e) => { if(moveKeys.hasOwnProperty(e.key.toLowerCase())) moveKeys[e.key.toLowerCase()] = false; });
+
+            window.startGame = () => {
+                if (isGameOver || isWon) { 
+                    window.location.reload(); 
+                    return; 
+                }
+                controls.lock(); 
+                document.getElementById('overlay').style.display = 'none';
+                gameStarted = true; 
+                if (audioListener && audioListener.context.state === 'suspended') {
+                    audioListener.context.resume();
+                }
+            };
+
+            animate();
+        }
+
+        function precomputePath() {
+            const targetX = Math.round(booster.position.x / CONFIG.roomSize);
+            const targetZ = Math.round(booster.position.z / CONFIG.roomSize);
+            let curX = 0, curZ = 0;
+            const visited = new Set();
+            visited.add(`0,0`);
+
+            while (curX !== targetX || curZ !== targetZ) {
+                let nextX = curX, nextZ = curZ;
+                const moveHorizontal = Math.random() > 0.5;
+                if (moveHorizontal && curX !== targetX) {
+                    nextX += (targetX > curX ? 1 : -1);
+                } else if (curZ !== targetZ) {
+                    nextZ += (targetZ > curZ ? 1 : -1);
+                } else {
+                    nextX += (targetX > curX ? 1 : -1);
+                }
+
+                if (nextX > curX) criticalPathKeys.add(`${curX},${curZ},3`);
+                if (nextX < curX) criticalPathKeys.add(`${curX},${curZ},2`);
+                if (nextZ > curZ) criticalPathKeys.add(`${curX},${curZ},1`);
+                if (nextZ < curZ) criticalPathKeys.add(`${curX},${curZ},0`);
+                if (nextX > curX) criticalPathKeys.add(`${nextX},${nextZ},2`);
+                if (nextX < curX) criticalPathKeys.add(`${nextX},${nextZ},3`);
+                if (nextZ > curZ) criticalPathKeys.add(`${nextX},${nextZ},0`);
+                if (nextZ < curZ) criticalPathKeys.add(`${nextX},${nextZ},1`);
+
+                curX = nextX; curZ = nextZ;
+                visited.add(`${curX},${curZ}`);
+                if (visited.size > 200) break;
+            }
+        }
+
+        function setupAudio() {
+            window.playHeartbeat = (intensity) => {
+                if (audioListener.context.state !== 'running') return;
+                const osc = audioListener.context.createOscillator();
+                const gain = audioListener.context.createGain();
+                osc.type = 'sine';
+                osc.frequency.setValueAtTime(50, audioListener.context.currentTime);
+                gain.gain.setValueAtTime(intensity * 0.8, audioListener.context.currentTime);
+                osc.connect(gain); gain.connect(audioListener.context.destination);
+                osc.start();
+                gain.gain.setTargetAtTime(0, audioListener.context.currentTime + 0.05, 0.05);
+                osc.stop(audioListener.context.currentTime + 0.2);
+            };
+            window.playScreech = () => {
+                if (audioListener.context.state !== 'running') return;
+                const osc = audioListener.context.createOscillator();
+                const gain = audioListener.context.createGain();
+                osc.type = 'sawtooth';
+                osc.frequency.setValueAtTime(60, audioListener.context.currentTime);
+                osc.frequency.exponentialRampToValueAtTime(3000, audioListener.context.currentTime + 0.5);
+                gain.gain.setValueAtTime(1.0, audioListener.context.currentTime);
+                gain.gain.exponentialRampToValueAtTime(0.001, audioListener.context.currentTime + 1.0);
+                osc.connect(gain); gain.connect(audioListener.context.destination);
+                osc.start(); osc.stop(audioListener.context.currentTime + 1.2);
+            };
+        }
+
+        function createStalker() {
+            stalker = new THREE.Group();
+            const body = new THREE.Mesh(new THREE.CapsuleGeometry(0.5, 1.8, 4, 8), new THREE.MeshBasicMaterial({ color: 0x000000 }));
+            body.position.y = 1.25;
+            stalker.add(body);
+            
+            const eyeGeo = new THREE.SphereGeometry(0.08);
+            const eyeMat = new THREE.MeshBasicMaterial({ color: 0xff0000 });
+            const e1 = new THREE.Mesh(eyeGeo, eyeMat); e1.position.set(-0.2, 2.0, 0.4);
+            const e2 = new THREE.Mesh(eyeGeo, eyeMat); e2.position.set(0.2, 2.0, 0.4);
+            stalker.add(e1, e2);
+            
+            const angle = Math.random() * Math.PI * 2;
+            const dist = CONFIG.stalkerSpawnMaxDist;
+            stalker.position.set(Math.cos(angle) * dist, 0, Math.sin(angle) * dist);
+            scene.add(stalker);
+        }
+
+        function createBooster() {
+            const angle = Math.random() * Math.PI * 2;
+            const dist = CONFIG.winDistance;
+            booster = new THREE.Group();
+            const mesh = new THREE.Mesh(new THREE.CylinderGeometry(0.6, 0.6, 3.5), new THREE.MeshStandardMaterial({ color: 0xffff00, emissive: 0x999900 }));
+            mesh.position.y = 1.75;
+            booster.add(mesh);
+            const light = new THREE.PointLight(0xffff00, 20, 40);
+            light.position.y = 3;
+            booster.add(light);
+            booster.position.set(Math.cos(angle) * dist, 0, Math.sin(angle) * dist);
+            scene.add(booster);
+        }
+
+        function createRoom(x, z) {
+            const group = new THREE.Group();
+            const size = CONFIG.roomSize;
+            const floor = new THREE.Mesh(new THREE.PlaneGeometry(size, size), new THREE.MeshStandardMaterial({ color: 0x222222 }));
+            floor.rotation.x = -Math.PI / 2;
+            floor.receiveShadow = true;
+            group.add(floor);
+            const ceil = floor.clone();
+            ceil.position.y = 4.5; ceil.rotation.x = Math.PI / 2;
+            group.add(ceil);
+            const wallMat = new THREE.MeshStandardMaterial({ color: 0x444433 });
+            const wallGeo = new THREE.BoxGeometry(size, 4.5, 0.8);
+            const sides = [
+                { pos: [0, 2.25, -size/2], rot: [0, 0, 0] },
+                { pos: [0, 2.25, size/2], rot: [0, 0, 0] },
+                { pos: [-size/2, 2.25, 0], rot: [0, Math.PI/2, 0] },
+                { pos: [size/2, 2.25, 0], rot: [0, Math.PI/2, 0] }
+            ];
+            const isSpawnRoom = (x === 0 && z === 0);
+            sides.forEach((side, idx) => {
+                if (criticalPathKeys.has(`${x},${z},${idx}`)) return;
+                let spawnProb = 0.55; 
+                if (isSpawnRoom) spawnProb = -1.0;
+                if (Math.random() < spawnProb) {
+                    const wall = new THREE.Mesh(wallGeo, wallMat);
+                    wall.position.set(...side.pos); wall.rotation.set(...side.rot);
+                    wall.castShadow = true;
+                    group.add(wall);
+                    const box = new THREE.Box3().setFromObject(wall);
+                    box.translate(new THREE.Vector3(x * size, 0, z * size));
+                    walls.push(box);
+                    wallData.push({ worldX: x * size + side.pos[0], worldZ: z * size + side.pos[2], isVert: side.rot[1] !== 0 });
+                }
+            });
+            group.position.set(x * size, 0, z * size);
+            scene.add(group);
+            return group;
+        }
+
+        function updateMaze(px, pz) {
+            const curX = Math.round(px / CONFIG.roomSize);
+            const curZ = Math.round(pz / CONFIG.roomSize);
+            for (let x = curX - CONFIG.mazeRadius; x <= curX + CONFIG.mazeRadius; x++) {
+                for (let z = curZ - CONFIG.mazeRadius; z <= curZ + CONFIG.mazeRadius; z++) {
+                    const key = `${x},${z}`;
+                    if (!rooms.has(key)) rooms.set(key, createRoom(x, z));
+                }
+            }
+        }
+
+        function triggerOverload() {
+            const now = Date.now();
+            if (overloadActive || now - lastOverloadTime < CONFIG.overloadCooldown) return;
+            overloadActive = true;
+            lastOverloadTime = now;
+            scene.fog.density = CONFIG.fogDensity * 0.4;
+            ambientLight.intensity = 4.0;
+            setTimeout(() => {
+                overloadActive = false;
+                ambientLight.intensity = 0.1;
+                scene.fog.density = CONFIG.fogDensity;
+            }, CONFIG.overloadDuration);
+        }
+
+        function updateMinimap() {
+            if (!minimapCtx) return;
+            minimapCtx.clearRect(0, 0, 300, 300);
+            const cx = 150, cy = 150, scale = 7.0; 
+            const px = camera.position.x, pz = camera.position.z;
+            minimapCtx.save();
+            minimapCtx.beginPath();
+            minimapCtx.arc(cx, cy, 145, 0, Math.PI * 2);
+            minimapCtx.clip();
+            const forward = new THREE.Vector3(0,0,-1).applyQuaternion(camera.quaternion);
+            const angle = Math.atan2(forward.z, forward.x);
+            minimapCtx.fillStyle = 'rgba(0, 255, 0, 0.15)';
+            minimapCtx.beginPath();
+            minimapCtx.moveTo(cx, cy);
+            minimapCtx.arc(cx, cy, 80, angle - 0.5, angle + 0.5);
+            minimapCtx.fill();
+            const bx = (booster.position.x - px) * scale;
+            const bz = (booster.position.z - pz) * scale;
+            const distToBooster = Math.sqrt(bx*bx + bz*bz);
+            const pulse = (Math.sin(Date.now() * 0.008) * 0.5 + 0.5);
+            let signalX = bx, signalZ = bz;
+            if (distToBooster > 140) {
+                const angleToSignal = Math.atan2(bz, bx);
+                signalX = Math.cos(angleToSignal) * 140;
+                signalZ = Math.sin(angleToSignal) * 140;
+            }
+            minimapCtx.fillStyle = `rgba(255, 255, 0, ${0.4 + pulse * 0.6})`;
+            minimapCtx.shadowBlur = 15;
+            minimapCtx.shadowColor = "yellow";
+            minimapCtx.beginPath(); 
+            minimapCtx.arc(cx + signalX, cy + signalZ, 8 + pulse * 4, 0, Math.PI*2); 
+            minimapCtx.fill();
+            minimapCtx.shadowBlur = 0;
+            minimapCtx.strokeStyle = 'rgba(0, 255, 0, 0.7)';
+            minimapCtx.lineWidth = 4;
+            wallData.forEach(w => {
+                const dx = (w.worldX - px) * scale;
+                const dz = (w.worldZ - pz) * scale;
+                if (Math.abs(dx) < 200 && Math.abs(dz) < 200) {
+                    const mx = cx + dx;
+                    const mz = cy + dz;
+                    minimapCtx.beginPath();
+                    if (w.isVert) {
+                        minimapCtx.moveTo(mx, mz - (CONFIG.roomSize/2 * scale));
+                        minimapCtx.lineTo(mx, mz + (CONFIG.roomSize/2 * scale));
+                    } else {
+                        minimapCtx.moveTo(mx - (CONFIG.roomSize/2 * scale), mz);
+                        minimapCtx.lineTo(mx + (CONFIG.roomSize/2 * scale), mz);
+                    }
+                    minimapCtx.stroke();
+                }
+            });
+            const sx = (stalker.position.x - px) * scale, sz = (stalker.position.z - pz) * scale;
+            const distToStalker = Math.sqrt(sx*sx + sz*sz);
+            if (distToStalker < 145) {
+                minimapCtx.fillStyle = `rgba(255, 0, 0, ${0.7 + Math.sin(Date.now()*0.015)*0.3})`;
+                minimapCtx.beginPath(); minimapCtx.arc(cx + sx, cy + sz, 7, 0, Math.PI*2); minimapCtx.fill();
+            }
+            minimapCtx.fillStyle = '#0f0';
+            minimapCtx.beginPath(); minimapCtx.arc(cx, cy, 5, 0, Math.PI*2); minimapCtx.fill();
+            minimapCtx.restore();
+        }
+
+        function handleMovement(delta) {
+            if (!controls.isLocked || isJumpscaring || isWon) return;
+            const speed = 6.2 * delta;
+            velocity.set(0, 0, 0);
+            direction.z = Number(moveKeys.w) - Number(moveKeys.s);
+            direction.x = Number(moveKeys.d) - Number(moveKeys.a);
+            direction.normalize();
+            if (moveKeys.w || moveKeys.s) velocity.z -= direction.z * speed;
+            if (moveKeys.a || moveKeys.d) velocity.x -= direction.x * speed;
+            const xDir = new THREE.Vector3(); 
+            camera.getWorldDirection(xDir); 
+            xDir.y = 0; xDir.normalize();
+            const xRight = new THREE.Vector3().crossVectors(camera.up, xDir);
+            const mx = (xDir.x * -velocity.z) + (xRight.x * velocity.x);
+            const mz = (xDir.z * -velocity.z) + (xRight.z * velocity.x);
+            const check = (nx, nz) => {
+                const pB = new THREE.Box3().setFromCenterAndSize(new THREE.Vector3(nx, 1, nz), new THREE.Vector3(CONFIG.playerRadius, 1.8, CONFIG.playerRadius));
+                for(let w of walls) { if(pB.intersectsBox(w)) return false; }
+                return true;
+            };
+            if (check(camera.position.x + mx, camera.position.z)) camera.position.x += mx;
+            if (check(camera.position.x, camera.position.z + mz)) camera.position.z += mz;
+            updateMaze(camera.position.x, camera.position.z);
+            if (camera.position.distanceTo(booster.position) < 4.0) triggerWin();
+        }
+
+        function triggerWin() {
+            if (isWon) return;
+            isWon = true; controls.unlock();
+            document.getElementById('overlay').style.display = 'flex';
+            document.getElementById('intro-content').style.display = 'none';
+            document.getElementById('win-screen').style.display = 'block';
+        }
+
+        function triggerJumpscare() {
+            if (isGameOver || isJumpscaring) return;
+            isJumpscaring = true;
+            controls.unlock();
+            if(window.playScreech) window.playScreech();
+            const lookDir = new THREE.Vector3();
+            camera.getWorldDirection(lookDir);
+            const jumpPos = camera.position.clone().add(lookDir.multiplyScalar(0.7));
+            stalker.position.copy(jumpPos);
+            stalker.position.y = camera.position.y - 1.25; 
+            stalker.lookAt(camera.position.x, camera.position.y, camera.position.z);
+            const shake = setInterval(() => {
+                camera.position.x += (Math.random() - 0.5) * 0.2;
+                camera.position.y += (Math.random() - 0.5) * 0.2;
+            }, 20);
+            setTimeout(() => { 
+                clearInterval(shake);
+                isGameOver = true; 
+                document.getElementById('overlay').style.display='flex'; 
+                document.getElementById('intro-content').style.display='none'; 
+                document.getElementById('game-over').style.display='block'; 
+            }, 1000);
+        }
+
+        function updateStalker(delta) {
+            if (isJumpscaring || isWon) return;
+            const dist = camera.position.distanceTo(stalker.position);
+            
+            // If too far, teleport closer (but not too close)
+            if (dist > CONFIG.stalkerDespawnDist) {
+                const angle = Math.random() * Math.PI * 2;
+                const spawnDist = CONFIG.stalkerSpawnMinDist + Math.random() * (CONFIG.stalkerSpawnMaxDist - CONFIG.stalkerSpawnMinDist);
+                stalker.position.set(
+                    camera.position.x + Math.cos(angle) * spawnDist,
+                    0,
+                    camera.position.z + Math.sin(angle) * spawnDist
+                );
+            }
+
+            if (dist < 2.0) { triggerJumpscare(); return; }
+
+            const frustum = new THREE.Frustum().setFromProjectionMatrix(new THREE.Matrix4().multiplyMatrices(camera.projectionMatrix, camera.matrixWorldInverse));
+            const stalkerBox = new THREE.Box3().setFromObject(stalker);
+            const isSeen = frustum.intersectsBox(stalkerBox);
+
+            // Stalker moves if not seen, or if it is already very close
+            if (!isSeen || dist < 6.0) {
+                const targetDir = new THREE.Vector3().subVectors(camera.position, stalker.position).normalize();
+                targetDir.y = 0;
+                
+                // Use a lower aggression speed threshold and a much lower base speed
+                const speed = (dist < 8 ? CONFIG.stalkerAggroSpeed : CONFIG.stalkerBaseSpeed);
+
+                const getCollision = (pos) => {
+                    const sB = new THREE.Box3().setFromCenterAndSize(pos, new THREE.Vector3(CONFIG.stalkerRadius, 1.8, CONFIG.stalkerRadius));
+                    for(let w of walls) { if(sB.intersectsBox(w)) return w; }
+                    return null;
+                };
+
+                let moveVec = targetDir.clone().multiplyScalar(speed);
+                let nextPos = stalker.position.clone().add(moveVec);
+                const hitWall = getCollision(nextPos);
+
+                if (hitWall) {
+                    let slideX = new THREE.Vector3(moveVec.x, 0, 0);
+                    let slideZ = new THREE.Vector3(0, 0, moveVec.z);
+                    
+                    if (!getCollision(stalker.position.clone().add(slideX))) {
+                        stalker.position.add(slideX);
+                    } else if (!getCollision(stalker.position.clone().add(slideZ))) {
+                        stalker.position.add(slideZ);
+                    } else {
+                        let bestGapDir = null;
+                        let bestDist = Infinity;
+                        for (let i = 0; i < 8; i++) {
+                            const angle = (i / 8) * Math.PI * 2;
+                            const testDir = new THREE.Vector3(Math.cos(angle), 0, Math.sin(angle)).multiplyScalar(speed);
+                            const testPos = stalker.position.clone().add(testDir);
+                            if (!getCollision(testPos)) {
+                                const d = testPos.distanceTo(camera.position);
+                                if (d < bestDist) {
+                                    bestDist = d;
+                                    bestGapDir = testDir;
+                                }
+                            }
+                        }
+                        if (bestGapDir) stalker.position.add(bestGapDir);
+                    }
+                } else {
+                    stalker.position.copy(nextPos);
+                }
+                
+                stalker.lookAt(camera.position.x, 0, camera.position.z);
+            }
+
+            const hr = THREE.MathUtils.lerp(CONFIG.heartbeatMaxFreq, CONFIG.heartbeatMinFreq, Math.min(dist/25, 1));
+            if (!window.lH || clock.elapsedTime - window.lH > 1/hr) {
+                if(window.playHeartbeat) window.playHeartbeat(THREE.MathUtils.lerp(1, 0.1, Math.min(dist/20, 1)));
+                window.lH = clock.elapsedTime;
+            }
+        }
+
+        function updateExtractionSignal() {
+            const indicator = document.getElementById('signal-indicator');
+            if (!indicator || !booster) return;
+            const toB = new THREE.Vector3().subVectors(booster.position, camera.position).normalize();
+            const fwd = new THREE.Vector3(0,0,-1).applyQuaternion(camera.quaternion);
+            const align = fwd.dot(toB);
+            const dist = camera.position.distanceTo(booster.position);
+            const distFactor = Math.max(0, 1 - (dist / (CONFIG.winDistance + 50)));
+            const glowIntensity = Math.max(0, align) * distFactor;
+            indicator.style.opacity = glowIntensity * (0.6 + Math.sin(Date.now()*0.005)*0.4);
+            const side = new THREE.Vector3(1,0,0).applyQuaternion(camera.quaternion).dot(toB);
+            indicator.style.transform = `translateX(-50%) translateX(${side * 150}px)`;
+            document.getElementById('status-text').innerText = dist < 20 ? "SIGNAL: CRITICAL" : `SIGNAL: ${Math.floor(dist)}m`;
+        }
+
+        function animate() {
+            requestAnimationFrame(animate);
+            const delta = clock.getDelta();
+            if (gameStarted && !isGameOver && !isWon && !isJumpscaring) {
+                handleMovement(delta);
+                updateStalker(delta);
+                updateMinimap();
+                updateExtractionSignal();
+                battery -= CONFIG.batteryDepletionRate * delta * 6;
+                document.getElementById('battery-text').innerText = Math.max(0, Math.floor(battery));
+                document.getElementById('battery-bar').style.width = Math.max(0, battery) + '%';
+                flashlight.position.copy(camera.position);
+                flashlightTarget.position.copy(camera.position).add(new THREE.Vector3(0,0,-1).applyQuaternion(camera.quaternion));
+                flashlight.intensity = battery > 0 ? CONFIG.baseLightIntensity * (battery/100) : 0;
+                const cd = Math.min((Date.now() - lastOverloadTime) / CONFIG.overloadCooldown, 1) * 100;
+                document.getElementById('overload-fill').style.width = cd + '%';
+            } else if (isJumpscaring) {
+                camera.lookAt(stalker.position.x, camera.position.y, stalker.position.z);
+            }
+            composer.render();
+        }
+
+        function onWindowResize() {
+            camera.aspect = window.innerWidth / window.innerHeight; 
+            camera.updateProjectionMatrix();
+            renderer.setSize(window.innerWidth, window.innerHeight); 
+            composer.setSize(window.innerWidth, window.innerHeight);
+        }
+
+        init();
+    </script>
+</body>
+</html>
