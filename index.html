@@ -138,8 +138,8 @@
             roomSize: 15,
             mazeRadius: 5, 
             batteryDepletionRate: 0.03,
-            stalkerBaseSpeed: 0.14, // Reduced from 0.26 (Significant slowdown)
-            stalkerAggroSpeed: 0.22, // Reduced from 0.39 (Slower proximity speed)
+            stalkerBaseSpeed: 0.11, // Slower (was 0.14)
+            stalkerAggroSpeed: 0.18, // Slower (was 0.22)
             heartbeatMinFreq: 1.0,
             heartbeatMaxFreq: 8.0,
             baseLightIntensity: 1200,
@@ -150,14 +150,17 @@
             playerRadius: 1.0, 
             stalkerRadius: 0.4, 
             winDistance: 130,
-            stalkerDespawnDist: 70, 
-            stalkerSpawnMinDist: 30, // Pushed min spawn further out
-            stalkerSpawnMaxDist: 40  // Pushed max spawn further out
+            stalkerDespawnDist: 85, 
+            stalkerSpawnMinDist: 45, 
+            stalkerSpawnMaxDist: 60, 
+            nearBoosterTeleportDist: 40, // Trigger teleport slightly closer to booster
+            stalkerTeleportOffset: 22 // Spawns just outside radar range (radar is 145px / 7 scale = ~20.7 units)
         };
 
         let scene, camera, renderer, controls, composer;
         let flashlight, flashlightTarget, clock, ambientLight;
         let battery = 100, gameStarted = false, isGameOver = false, isJumpscaring = false, isWon = false;
+        let hasTriggeredNearTeleport = false;
         
         let minimapCanvas, minimapCtx;
         let overloadActive = false, lastOverloadTime = -CONFIG.overloadCooldown;
@@ -487,7 +490,27 @@
             if (check(camera.position.x + mx, camera.position.z)) camera.position.x += mx;
             if (check(camera.position.x, camera.position.z + mz)) camera.position.z += mz;
             updateMaze(camera.position.x, camera.position.z);
-            if (camera.position.distanceTo(booster.position) < 4.0) triggerWin();
+            
+            const distToBooster = camera.position.distanceTo(booster.position);
+            if (distToBooster < 4.0) triggerWin();
+            
+            if (!hasTriggeredNearTeleport && distToBooster < CONFIG.nearBoosterTeleportDist) {
+                hasTriggeredNearTeleport = true;
+                teleportStalkerBehindPlayer();
+            }
+        }
+
+        function teleportStalkerBehindPlayer() {
+            const lookDir = new THREE.Vector3();
+            camera.getWorldDirection(lookDir);
+            lookDir.y = 0; lookDir.normalize();
+            
+            // Spawn precisely at the edge of the radar circle to maintain tension without instant-hit
+            const behindPos = camera.position.clone().sub(lookDir.multiplyScalar(CONFIG.stalkerTeleportOffset));
+            stalker.position.copy(behindPos);
+            stalker.position.y = 0;
+            
+            if (window.playHeartbeat) window.playHeartbeat(1.0);
         }
 
         function triggerWin() {
@@ -526,7 +549,6 @@
             if (isJumpscaring || isWon) return;
             const dist = camera.position.distanceTo(stalker.position);
             
-            // If too far, teleport closer (but not too close)
             if (dist > CONFIG.stalkerDespawnDist) {
                 const angle = Math.random() * Math.PI * 2;
                 const spawnDist = CONFIG.stalkerSpawnMinDist + Math.random() * (CONFIG.stalkerSpawnMaxDist - CONFIG.stalkerSpawnMinDist);
@@ -543,12 +565,9 @@
             const stalkerBox = new THREE.Box3().setFromObject(stalker);
             const isSeen = frustum.intersectsBox(stalkerBox);
 
-            // Stalker moves if not seen, or if it is already very close
             if (!isSeen || dist < 6.0) {
                 const targetDir = new THREE.Vector3().subVectors(camera.position, stalker.position).normalize();
                 targetDir.y = 0;
-                
-                // Use a lower aggression speed threshold and a much lower base speed
                 const speed = (dist < 8 ? CONFIG.stalkerAggroSpeed : CONFIG.stalkerBaseSpeed);
 
                 const getCollision = (pos) => {
